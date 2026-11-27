@@ -81,6 +81,29 @@ func TestParseCatalogErrors(t *testing.T) {
 	}
 }
 
+// The catalog the image ships must load, and must cover what gencan sends.
+func TestBenchCatalog(t *testing.T) {
+	got, err := loadCatalog("../../catalog/bench.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[idKey]messageType{
+		{id: 0x100}:                      typePeriodic,
+		{id: 0x200}:                      typePeriodic,
+		{id: 0x300}:                      typePeriodic,
+		{id: 0x18DAF110, extended: true}: typePeriodic,
+		{id: 0x400}:                      typeEvent,
+	}
+	if len(got) != len(want) {
+		t.Errorf("bench catalog has %d messages, want %d", len(got), len(want))
+	}
+	for k, kind := range want {
+		if s, ok := got[k]; !ok || s.kind != kind {
+			t.Errorf("bench catalog %s = %+v, %v; want type %s", k.label(), s, ok, kind)
+		}
+	}
+}
+
 func TestLoadCatalogWithoutPath(t *testing.T) {
 	got, err := loadCatalog("")
 	if err != nil || len(got) != 0 {

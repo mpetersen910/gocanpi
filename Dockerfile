@@ -10,4 +10,6 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
 
 FROM scratch
 COPY --from=build /out/app /app
+# colcan reads it with -catalog=/etc/colcan/catalog.yaml; gencan ignores it.
+COPY catalog/bench.yaml /etc/colcan/catalog.yaml
 ENTRYPOINT ["/app"]

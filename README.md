@@ -13,7 +13,7 @@ Linux only (`AF_CAN`). Needs `CAP_NET_RAW` (or root) and an up interface.
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o colcan ./cmd/colcan
-./colcan -ifaces can0,can1 -catalog catalog.yaml
+./colcan -ifaces can0,can1 -catalog catalog/bench.yaml
 curl -s http://127.0.0.1:9100/metrics | grep '^can_'
 ```
 
@@ -40,7 +40,16 @@ Arrival times come from the kernel (`SO_TIMESTAMPNS`), so they don't include col
 
 ### Catalog
 
-What a spec sheet (a DBC file, the NMEA 2000 PGN list) says about each message. Every cataloged message gets checks for its type, and each metric below carries `{iface, can_id, message}`. Messages not in the catalog only get the generic per-ID metrics.
+What a spec sheet (a DBC file, the NMEA 2000 PGN list) says about each message. You give each message a type, and colcan sets up the checks and metrics for that type. Every metric below carries `{iface, can_id, message}`. Messages not in the catalog only get the generic per-ID metrics.
+
+| Type | Question it answers | Metrics it creates |
+|------|---------------------|--------------------|
+| any cataloged message | Is it still alive? | `can_frame_last_seen_timestamp_seconds` |
+| `periodic` | Is it on time? | `can_frame_interval_ratio`, `can_frames_late_total`, `can_frames_missed_estimated_total` |
+| `event` | Is it flooding, or has it gone quiet too long? | `can_frame_interval_seconds`, `can_frames_too_soon_total`, `can_frames_overdue_total` |
+| has a `counter` | Did frames go missing? | `can_frames_missed_total`, `can_sequence_restarts_total` |
+
+The bench catalog is [`catalog/bench.yaml`](catalog/bench.yaml). The Dockerfile copies it into the image at `/etc/colcan/catalog.yaml`, so changing it takes a rebuild (`build.sh`) and a tag bump in can-gitops. The format:
 
 ```yaml
 messages:
@@ -150,10 +159,10 @@ Two senders must never share an ID, so keep the burst and event IDs out of the s
 ```bash
 docker buildx build --platform linux/arm64 -t gocanpi --load .
 docker buildx build --platform linux/arm64 --build-arg TARGET=./cmd/gencan -t gencan --load .
-docker run --network host --cap-add NET_RAW gocanpi -ifaces can1
+docker run --network host --cap-add NET_RAW gocanpi -ifaces can0,can1 -catalog /etc/colcan/catalog.yaml
 ```
 
-Static binary, `scratch` image. Host must already have `can0` / `can1` up. `build.sh` builds both and pushes them to the bench registry.
+Static binary, `scratch` image, plus the bench catalog at `/etc/colcan/catalog.yaml`. Host must already have `can0` / `can1` up. `build.sh` builds both and pushes them to the bench registry.
 
 ## Tests
 
