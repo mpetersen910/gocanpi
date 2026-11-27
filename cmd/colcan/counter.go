@@ -12,18 +12,19 @@ import (
 
 // Many messages carry a rolling counter (AUTOSAR E2E protection puts one in
 // every safety-relevant frame). When the spec says where it lives, drops can
-// be counted exactly instead of inferred from timing.
+// be counted exactly instead of inferred from timing, and for an event
+// message, whose timing promises nothing, it is the only way to see them.
 
 var (
 	framesMissed = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "can_frames_missed_total",
 		Help: "Frames missing according to the message's own rolling counter.",
-	}, []string{"iface", "can_id"})
+	}, catalogLabels)
 
 	sequenceRestarts = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "can_sequence_restarts_total",
 		Help: "Times a message's rolling counter went backwards, meaning its sender restarted.",
-	}, []string{"iface", "can_id"})
+	}, catalogLabels)
 )
 
 // counterField is where a message keeps its counter: width bytes starting at
@@ -50,36 +51,18 @@ func (c counterField) modulus() uint64 {
 	return 1 << (8 * c.width)
 }
 
-// parseCounters reads a list like "100:0-3": bytes 0 through 3 of ID 100.
-func parseCounters(s string) (map[idKey]counterField, error) {
-	fields := map[idKey]counterField{}
-	for _, entry := range splitAndTrim(s) {
-		idText, rangeText, ok := strings.Cut(entry, ":")
-		if !ok {
-			return nil, fmt.Errorf("%q: want ID:first-last, e.g. 100:0-3", entry)
-		}
-		k, err := parseID(idText)
-		if err != nil {
-			return nil, err
-		}
-		firstText, lastText, ok := strings.Cut(strings.TrimSpace(rangeText), "-")
-		if !ok {
-			return nil, fmt.Errorf("%q: want a byte range like 0-3", entry)
-		}
-		first, err1 := strconv.Atoi(firstText)
-		last, err2 := strconv.Atoi(lastText)
-		if err1 != nil || err2 != nil || first < 0 || last < first {
-			return nil, fmt.Errorf("%q: want a byte range like 0-3", entry)
-		}
-		if width := last - first + 1; width > 4 {
-			return nil, fmt.Errorf("%q: counters can be at most 4 bytes", entry)
-		}
-		if _, dup := fields[k]; dup {
-			return nil, fmt.Errorf("%s is listed twice", k.label())
-		}
-		fields[k] = counterField{offset: first, width: last - first + 1}
+// parseByteRange reads "first-last", e.g. "0-3" for bytes 0 through 3.
+func parseByteRange(s string) (counterField, error) {
+	firstText, lastText, ok := strings.Cut(strings.TrimSpace(s), "-")
+	first, err1 := strconv.Atoi(firstText)
+	last, err2 := strconv.Atoi(lastText)
+	if !ok || err1 != nil || err2 != nil || first < 0 || last < first {
+		return counterField{}, fmt.Errorf("%q: want a byte range like 0-3", s)
 	}
-	return fields, nil
+	if width := last - first + 1; width > 4 {
+		return counterField{}, fmt.Errorf("%q: a counter can be at most 4 bytes", s)
+	}
+	return counterField{offset: first, width: last - first + 1}, nil
 }
 
 // seqGap compares a counter with its previous value. The difference is taken
@@ -97,45 +80,44 @@ func seqGap(last, seq uint32, modulus uint64) (missed uint64, restart bool) {
 	return 0, true
 }
 
-// counters tracks the rolling counters configured for one interface. Only
-// that interface's reader goroutine touches it.
-type counters struct {
-	iface  string
-	fields map[idKey]counterField
-	last   map[idKey]uint32
+type counterMonitor struct {
+	iface string
+	spec  messageSpec
+	last  uint32
+	seen  bool
+
+	missed   prometheus.Counter
+	restarts prometheus.Counter
 }
 
-func newCounters(iface string, fields map[idKey]counterField) *counters {
-	for k := range fields {
-		id := k.label()
-		framesMissed.WithLabelValues(iface, id)
-		sequenceRestarts.WithLabelValues(iface, id)
+func newCounterMonitor(iface string, s messageSpec) *counterMonitor {
+	l := s.labels(iface)
+	return &counterMonitor{
+		iface:    iface,
+		spec:     s,
+		missed:   framesMissed.WithLabelValues(l...),
+		restarts: sequenceRestarts.WithLabelValues(l...),
 	}
-	return &counters{iface: iface, fields: fields, last: map[idKey]uint32{}}
 }
 
-func (c *counters) observe(k idKey, data []byte) {
-	field, ok := c.fields[k]
+func (m *counterMonitor) observe(f Frame) {
+	seq, ok := m.spec.counter.read(f.Data)
 	if !ok {
 		return
 	}
-	seq, ok := field.read(data)
-	if !ok {
-		return
-	}
-	prev, seen := c.last[k]
-	c.last[k] = seq
+	prev, seen := m.last, m.seen
+	m.last, m.seen = seq, true
 	if !seen {
 		return
 	}
 
-	missed, restart := seqGap(prev, seq, field.modulus())
+	missed, restart := seqGap(prev, seq, m.spec.counter.modulus())
 	if restart {
-		sequenceRestarts.WithLabelValues(c.iface, k.label()).Inc()
-		log.Printf("%s: %s counter went from %d back to %d; sender restarted", c.iface, k.label(), prev, seq)
+		m.restarts.Inc()
+		log.Printf("%s: %s counter went from %d back to %d; sender restarted", m.iface, m.spec.name, prev, seq)
 		return
 	}
 	if missed > 0 {
-		framesMissed.WithLabelValues(c.iface, k.label()).Add(float64(missed))
+		m.missed.Add(float64(missed))
 	}
 }

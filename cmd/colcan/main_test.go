@@ -30,6 +30,18 @@ func TestParseID(t *testing.T) {
 	}
 }
 
+func TestIsLocal(t *testing.T) {
+	if isLocal(0) {
+		t.Error("a frame with no flags counted as local")
+	}
+	if !isLocal(unix.MSG_DONTROUTE) {
+		t.Error("a MSG_DONTROUTE frame wasn't counted as local")
+	}
+	if !isLocal(unix.MSG_DONTROUTE | unix.MSG_CONFIRM) {
+		t.Error("a frame echoed to its own socket wasn't counted as local")
+	}
+}
+
 func TestRxTime(t *testing.T) {
 	want := time.Unix(1764126300, 123456789)
 	ts := unix.NsecToTimespec(want.UnixNano())

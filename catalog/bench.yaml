@@ -1,0 +1,40 @@
+# What a spec sheet would say about each message on the bench bus. colcan
+# checks every frame of these messages against its entry; anything else only
+# gets the generic per-ID metrics. 0x7FF (gencan-burst) is left out on
+# purpose: it is a disturbance, not part of the system being watched.
+#
+# The Dockerfile copies this into the image at /etc/colcan/catalog.yaml, so a
+# change here reaches the bench only after build.sh and a tag bump in
+# can-gitops.
+#
+# The periods assume gencan -scale=0.5; at 1.0 they are 10ms, 100ms, 50ms, 1s.
+messages:
+  - id: "100"
+    name: fast_counter
+    type: periodic
+    period: 5ms
+    counter: 0-3        # 4-byte rolling counter
+
+  - id: "200"
+    name: slow_status
+    type: periodic
+    period: 50ms
+
+  - id: "300"
+    name: fd_payload
+    type: periodic
+    period: 25ms
+
+  - id: "18DAF110"
+    name: diag_extended
+    type: periodic
+    period: 500ms
+
+  # gencan-event on can1. 90ms is 10% under its 100ms minimum gap, so
+  # timestamp jitter doesn't trip the check; 7.5s is 1.5 heartbeats.
+  - id: "400"
+    name: cabin_temp
+    type: event
+    min_gap: 90ms
+    max_silence: 7.5s
+    counter: 2-2        # 8-bit rolling counter

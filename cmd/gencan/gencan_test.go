@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"testing"
+	"time"
 )
 
 func TestPadToValidFD(t *testing.T) {
@@ -39,8 +40,13 @@ func TestCheckFlags(t *testing.T) {
 		{"standard", []string{"iface", "scale", "quiet"}, true},
 		{"standard", []string{"burst-every"}, false},
 		{"standard", []string{"burst-id"}, false},
+		{"standard", []string{"event-heartbeat"}, false},
 		{"burst", []string{"iface", "burst-id", "burst-count", "burst-every"}, true},
 		{"burst", []string{"scale"}, false},
+		{"burst", []string{"event-id"}, false},
+		{"event", []string{"iface", "quiet", "event-id", "event-deadband", "event-min-gap", "event-heartbeat", "event-seed"}, true},
+		{"event", []string{"burst-count"}, false},
+		{"event", []string{"scale"}, false},
 		{"pulse", nil, false},
 	}
 	for _, c := range cases {
@@ -80,12 +86,75 @@ func TestEncode(t *testing.T) {
 	}
 }
 
-// Two senders must never share an ID, so the schedule has to leave the
-// burst default alone.
-func TestScheduleLeavesBurstIDFree(t *testing.T) {
+// Two senders must never share an ID, so the schedule has to leave the burst
+// and event defaults alone.
+func TestDefaultIDsAreUnique(t *testing.T) {
+	if defaultBurstID == defaultEventID {
+		t.Fatal("burst and event mode default to the same ID")
+	}
 	for _, m := range schedule {
-		if !m.extended && m.id == 0x7FF {
-			t.Errorf("schedule message %s uses 7FF, the burst default", m.label)
+		if !m.extended && (m.id == defaultBurstID || m.id == defaultEventID) {
+			t.Errorf("schedule message %s uses %03X, a burst or event default", m.label, m.id)
+		}
+	}
+}
+
+func TestShouldSend(t *testing.T) {
+	cfg := eventConfig{deadband: 0.5, minGap: 100 * time.Millisecond, heartbeat: 5 * time.Second}
+	noHeartbeat := cfg
+	noHeartbeat.heartbeat = 0
+
+	t0 := time.Unix(1764126300, 0)
+	at := func(d time.Duration) time.Time { return t0.Add(d) }
+	sent := sensorState{sentAny: true, lastSent: t0, lastValue: 21.0}
+
+	cases := []struct {
+		name  string
+		cfg   eventConfig
+		state sensorState
+		now   time.Time
+		value float64
+		want  sendReason
+	}{
+		{"first reading", cfg, sensorState{}, t0, 21.0, sendFirst},
+		{"change below the deadband", cfg, sent, at(time.Second), 21.4, noSend},
+		{"change up", cfg, sent, at(time.Second), 21.5, sendChange},
+		{"change down", cfg, sent, at(time.Second), 20.4, sendChange},
+		{"change held by the min gap", cfg, sent, at(40 * time.Millisecond), 22.0, noSend},
+		{"change once the min gap passes", cfg, sent, at(100 * time.Millisecond), 22.0, sendChange},
+		{"quiet before the heartbeat", cfg, sent, at(4900 * time.Millisecond), 21.1, noSend},
+		{"heartbeat", cfg, sent, at(5 * time.Second), 21.1, sendHeartbeat},
+		{"change wins over heartbeat", cfg, sent, at(6 * time.Second), 22.0, sendChange},
+		{"heartbeat disabled", noHeartbeat, sent, at(time.Minute), 21.1, noSend},
+	}
+	for _, c := range cases {
+		if got := shouldSend(c.state, c.now, c.value, c.cfg); got != c.want {
+			t.Errorf("%s: shouldSend = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestEncodeTemp(t *testing.T) {
+	b := make([]byte, 8)
+	encodeTemp(b, 21.34, 7)
+	if got := int16(binary.BigEndian.Uint16(b[0:2])); got != 213 {
+		t.Errorf("21.34 C encoded as %d, want 213 tenths", got)
+	}
+	if b[2] != 7 {
+		t.Errorf("counter byte = %d, want 7", b[2])
+	}
+
+	b = make([]byte, 8)
+	encodeTemp(b, -5.26, 255)
+	if got := int16(binary.BigEndian.Uint16(b[0:2])); got != -53 {
+		t.Errorf("-5.26 C encoded as %d, want -53 tenths", got)
+	}
+	if b[2] != 255 {
+		t.Errorf("counter byte = %d, want 255", b[2])
+	}
+	for i, v := range b[3:] {
+		if v != 0 {
+			t.Errorf("byte %d = %02X, want 0", i+3, v)
 		}
 	}
 }
