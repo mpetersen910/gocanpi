@@ -2,26 +2,24 @@ package main
 
 import (
 	"encoding/binary"
-	"maps"
 	"testing"
 )
 
-func TestParseCounters(t *testing.T) {
-	got, err := parseCounters("100:0-3, 18DAF110:2-3")
-	if err != nil {
-		t.Fatal(err)
+func TestParseByteRange(t *testing.T) {
+	good := map[string]counterField{
+		"0-3":   {offset: 0, width: 4},
+		"2-2":   {offset: 2, width: 1},
+		" 4-5 ": {offset: 4, width: 2},
 	}
-	want := map[idKey]counterField{
-		{id: 0x100}:                      {offset: 0, width: 4},
-		{id: 0x18DAF110, extended: true}: {offset: 2, width: 2},
+	for in, want := range good {
+		got, err := parseByteRange(in)
+		if err != nil || got != want {
+			t.Errorf("parseByteRange(%q) = %+v, %v; want %+v", in, got, err, want)
+		}
 	}
-	if !maps.Equal(got, want) {
-		t.Errorf("parseCounters = %v, want %v", got, want)
-	}
-
-	for _, in := range []string{"100", "100:3", "100:3-1", "100:0-4", "100:-1-2", "100:a-b", "100:0-3,100:4-5"} {
-		if _, err := parseCounters(in); err == nil {
-			t.Errorf("parseCounters(%q) succeeded, want an error", in)
+	for _, in := range []string{"", "3", "3-1", "0-4", "-1-2", "a-b"} {
+		if _, err := parseByteRange(in); err == nil {
+			t.Errorf("parseByteRange(%q) succeeded, want an error", in)
 		}
 	}
 }
@@ -30,8 +28,8 @@ func TestCounterFieldRead(t *testing.T) {
 	if v, ok := (counterField{offset: 0, width: 4}).read([]byte{0x00, 0x00, 0x13, 0x88, 9, 9, 9, 9}); !ok || v != 5000 {
 		t.Errorf("4-byte read = %d, %v; want 5000", v, ok)
 	}
-	if v, ok := (counterField{offset: 2, width: 2}).read([]byte{0x02, 0x01, 0x00, 0x07}); !ok || v != 7 {
-		t.Errorf("2-byte read at offset 2 = %d, %v; want 7", v, ok)
+	if v, ok := (counterField{offset: 2, width: 1}).read([]byte{0x00, 0xD5, 0x07, 0}); !ok || v != 7 {
+		t.Errorf("1-byte read at offset 2 = %d, %v; want 7", v, ok)
 	}
 	if _, ok := (counterField{offset: 0, width: 4}).read([]byte{1, 2, 3}); ok {
 		t.Error("read past the end of the payload succeeded")
@@ -39,7 +37,7 @@ func TestCounterFieldRead(t *testing.T) {
 }
 
 func TestSeqGap(t *testing.T) {
-	const m32, m16 = 1 << 32, 1 << 16
+	const m32, m8 = 1 << 32, 1 << 8
 	cases := []struct {
 		name      string
 		last, seq uint32
@@ -55,8 +53,9 @@ func TestSeqGap(t *testing.T) {
 		{"restart", 5000, 0, m32, 0, true},
 		{"largest gap", 0, 1<<31 - 1, m32, 1<<31 - 2, false},
 		{"half the range is a restart", 0, 1 << 31, m32, 0, true},
-		{"16-bit rollover", 0xFFFF, 0, m16, 0, false},
-		{"16-bit restart", 1000, 0, m16, 0, true},
+		{"8-bit rollover", 255, 0, m8, 0, false},
+		{"8-bit gap", 250, 3, m8, 8, false},
+		{"8-bit restart", 100, 0, m8, 0, true},
 	}
 	for _, c := range cases {
 		missed, restart := seqGap(c.last, c.seq, c.modulus)
@@ -66,26 +65,28 @@ func TestSeqGap(t *testing.T) {
 	}
 }
 
-func TestCountersObserve(t *testing.T) {
-	const iface = "test-counters"
-	k := idKey{id: 0x100}
-	c := newCounters(iface, map[idKey]counterField{k: {offset: 0, width: 4}})
+func TestCounterMonitor(t *testing.T) {
+	const iface = "test-counter"
+	field := counterField{offset: 0, width: 4}
+	s := messageSpec{key: idKey{id: 0x100}, name: "fast_counter", kind: typePeriodic, counter: &field}
+	m := newCounterMonitor(iface, s)
 
-	frame := func(seq uint32) []byte {
+	frame := func(seq uint32) Frame {
 		b := make([]byte, 8)
 		binary.BigEndian.PutUint32(b, seq)
-		return b
+		return Frame{Data: b}
 	}
 	// 10, 11, then 12 and 13 lost, then the sender restarts at 0.
 	for _, seq := range []uint32{10, 11, 14, 0, 1} {
-		c.observe(k, frame(seq))
+		m.observe(frame(seq))
 	}
-	c.observe(k, []byte{1, 2}) // too short to hold the counter: ignored
+	m.observe(Frame{Data: []byte{1, 2}}) // too short to hold the counter: ignored
 
-	if got := counterValue(t, framesMissed, iface, "100"); got != 2 {
+	labels := s.labels(iface)
+	if got := counterValue(t, framesMissed, labels...); got != 2 {
 		t.Errorf("missed = %v, want 2", got)
 	}
-	if got := counterValue(t, sequenceRestarts, iface, "100"); got != 1 {
+	if got := counterValue(t, sequenceRestarts, labels...); got != 1 {
 		t.Errorf("restarts = %v, want 1", got)
 	}
 }

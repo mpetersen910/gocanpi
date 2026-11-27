@@ -5,6 +5,7 @@ go 1.26.6
 require (
 	github.com/prometheus/client_golang v1.24.1
 	golang.org/x/sys v0.47.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

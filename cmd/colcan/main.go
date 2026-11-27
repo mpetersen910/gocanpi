@@ -108,6 +108,11 @@ var (
 		Help: "Failed reads from the CAN socket, by interface.",
 	}, []string{"iface"})
 
+	localDropped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "can_frames_local_dropped_total",
+		Help: "Frames ignored because they were sent from this machine rather than heard on the wire, by interface.",
+	}, []string{"iface"})
+
 	lastFrame = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "can_last_frame_timestamp_seconds",
 		Help: "Unix timestamp of the most recent frame, by interface. Staleness alarm.",
@@ -285,19 +290,26 @@ func rxTime(oob []byte) time.Time {
 	return time.Now()
 }
 
+// isLocal reports whether a frame was sent from this machine rather than
+// heard on the wire. SocketCAN gives every socket on an interface a copy of
+// what the others send there, and marks those copies with MSG_DONTROUTE.
+func isLocal(recvflags int) bool {
+	return recvflags&unix.MSG_DONTROUTE != 0
+}
+
 // ---------------------------------------------------------------------------
 // Reader
 // ---------------------------------------------------------------------------
 
 type reader struct {
-	iface    string
-	fd       int
-	maxIDs   int
-	perID    bool
-	mu       sync.Mutex
-	seenIDs  map[uint32]bool
-	timing   *timing
-	counters *counters
+	iface        string
+	fd           int
+	maxIDs       int
+	perID        bool
+	includeLocal bool
+	mu           sync.Mutex
+	seenIDs      map[uint32]bool
+	monitors     map[idKey][]monitor
 }
 
 func (r *reader) run(ctx context.Context) {
@@ -317,7 +329,7 @@ func (r *reader) run(ctx context.Context) {
 		default:
 		}
 
-		n, oobn, _, _, err := unix.Recvmsg(r.fd, buf, oob, 0)
+		n, oobn, recvflags, _, err := unix.Recvmsg(r.fd, buf, oob, 0)
 		if err != nil {
 			if errors.Is(err, unix.EINTR) {
 				continue // interrupted by a signal, retry
@@ -328,6 +340,13 @@ func (r *reader) run(ctx context.Context) {
 			readErrors.WithLabelValues(r.iface).Inc()
 			log.Printf("%s: read: %v", r.iface, err)
 			time.Sleep(100 * time.Millisecond) // don't spin on a dead socket
+			continue
+		}
+
+		// An outside listener only hears the wire. Frames this machine sent
+		// are heard on the wire by the other interface's reader instead.
+		if !r.includeLocal && isLocal(recvflags) {
+			localDropped.WithLabelValues(r.iface).Inc()
 			continue
 		}
 
@@ -362,8 +381,9 @@ func (r *reader) record(f Frame) {
 	payloadLen.WithLabelValues(r.iface).Observe(float64(len(f.Data)))
 
 	k := idKey{id: f.ID, extended: f.Extended}
-	r.timing.observe(k, f.RxTime)
-	r.counters.observe(k, f.Data)
+	for _, m := range r.monitors[k] {
+		m.observe(f)
+	}
 
 	if !r.perID {
 		return
@@ -437,18 +457,17 @@ func main() {
 		noFD   = flag.Bool("no-fd", false, "disable CAN-FD reception (classic frames only)")
 		noErrs = flag.Bool("no-errors", false, "don't subscribe to error frames")
 
-		periodSpec  = flag.String("periods", "", "expected period per CAN ID, e.g. 100:5ms,18DAF110:500ms; enables interval, late and estimated-missed metrics")
-		counterSpec = flag.String("counters", "", "payload bytes holding a big-endian rolling counter per CAN ID, e.g. 100:0-3; enables exact missed and restart metrics")
+		catalogPath  = flag.String("catalog", "", "YAML message catalog: each ID's name, type (periodic or event), limits and counter")
+		includeLocal = flag.Bool("include-local", false, "also count frames sent from this machine, not just those heard on the wire")
 	)
 	flag.Parse()
 
-	periods, err := parsePeriods(*periodSpec)
+	catalog, err := loadCatalog(*catalogPath)
 	if err != nil {
-		log.Fatalf("-periods: %v", err)
+		log.Fatalf("-catalog: %v", err)
 	}
-	counterFields, err := parseCounters(*counterSpec)
-	if err != nil {
-		log.Fatalf("-counters: %v", err)
+	if *catalogPath != "" {
+		log.Printf("catalog: %d messages from %s", len(catalog), *catalogPath)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -462,10 +481,11 @@ func main() {
 		}
 		fds = append(fds, fd)
 
+		localDropped.WithLabelValues(name)
 		r := &reader{
 			iface: name, fd: fd, perID: *perID, maxIDs: *maxIDs,
-			timing:   newTiming(name, periods),
-			counters: newCounters(name, counterFields),
+			includeLocal: *includeLocal,
+			monitors:     newMonitors(name, catalog),
 		}
 		go r.run(ctx)
 	}
