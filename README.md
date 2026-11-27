@@ -47,7 +47,12 @@ colcan only observes; nothing has to be added to a payload. Arrival times come f
 - `can_frames_missed_total` — gaps in the counter.
 - `can_sequence_restarts_total` — the counter went backwards, meaning the sender restarted. Never counted as missed.
 
-Timing can't tell a frame delayed by more than half a period from a lost one, and it counts a sender outage as missing frames. Counters do neither. For a message with both, the difference between the two missed counts shows that limit.
+The two disagree in predictable ways:
+
+- Timing can't tell a frame delayed by more than half a period from a lost one; a counter can, because the late frame still carries the next number.
+- Timing counts every expected frame that didn't arrive. A counter counts frames the sender numbered that never arrived. When the sender restarts, its counter starts again at 0, so the outage shows up as a restart instead of losses. Frames lost while the sender kept running (an unplugged bus, a full tx queue) are counted by both.
+
+For a message with both, the difference between the two missed counts shows these limits.
 
 ```promql
 # interval distribution for 0x100 (heatmap)
