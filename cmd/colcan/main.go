@@ -19,6 +19,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -137,6 +139,7 @@ type Frame struct {
 	BRS      bool   // bit rate switch was set
 	ESI      bool   // error state indicator was set
 	Data     []byte
+	RxTime   time.Time // when the kernel received the frame
 }
 
 // parseFrame decodes the raw bytes read from the socket.
@@ -247,6 +250,14 @@ func openCAN(iface string, wantFD, wantErrors bool) (int, error) {
 		}
 	}
 
+	// Have the kernel stamp each frame as the driver hands it up. Timing
+	// taken after Read returns would include however long this goroutine
+	// took to get scheduled, which is the same size as the jitter we measure.
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPNS, 1); err != nil {
+		unix.Close(fd)
+		return -1, fmt.Errorf("enable timestamps: %w", err)
+	}
+
 	if err := unix.Bind(fd, &unix.SockaddrCAN{Ifindex: ifi.Index}); err != nil {
 		unix.Close(fd)
 		return -1, fmt.Errorf("bind %s: %w", iface, err)
@@ -255,36 +266,58 @@ func openCAN(iface string, wantFD, wantErrors bool) (int, error) {
 	return fd, nil
 }
 
+// rxTime pulls the kernel's receive timestamp out of the control messages
+// that arrive with a frame, falling back to now if there isn't one.
+func rxTime(oob []byte) time.Time {
+	msgs, err := unix.ParseSocketControlMessage(oob)
+	if err != nil {
+		return time.Now()
+	}
+	for _, m := range msgs {
+		if m.Header.Level != unix.SOL_SOCKET || m.Header.Type != unix.SCM_TIMESTAMPNS {
+			continue
+		}
+		var ts unix.Timespec
+		if _, err := binary.Decode(m.Data, binary.NativeEndian, &ts); err == nil {
+			return time.Unix(ts.Unix())
+		}
+	}
+	return time.Now()
+}
+
 // ---------------------------------------------------------------------------
 // Reader
 // ---------------------------------------------------------------------------
 
 type reader struct {
-	iface   string
-	fd      int
-	maxIDs  int
-	perID   bool
-	mu      sync.Mutex
-	seenIDs map[uint32]bool
+	iface    string
+	fd       int
+	maxIDs   int
+	perID    bool
+	mu       sync.Mutex
+	seenIDs  map[uint32]bool
+	timing   *timing
+	counters *counters
 }
 
 func (r *reader) run(ctx context.Context) {
 	buf := make([]byte, canFDMTU)
+	oob := make([]byte, unix.CmsgSpace(binary.Size(unix.Timespec{})))
 	r.seenIDs = make(map[uint32]bool)
 
 	log.Printf("reading %s", r.iface)
 
 	for {
-		// Bail out if we're shutting down. The read below blocks, so the
-		// actual unblock comes from Close() in main, which makes Read
-		// return EBADF and drops us into the error branch.
+		// Bail out if we're shutting down. Closing the socket in main does
+		// not wake a Recvmsg that is already blocked; on a busy bus the next
+		// frame does, and on a quiet one main exits without waiting for us.
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
 
-		n, err := unix.Read(r.fd, buf)
+		n, oobn, _, _, err := unix.Recvmsg(r.fd, buf, oob, 0)
 		if err != nil {
 			if errors.Is(err, unix.EINTR) {
 				continue // interrupted by a signal, retry
@@ -303,6 +336,7 @@ func (r *reader) run(ctx context.Context) {
 			readErrors.WithLabelValues(r.iface).Inc()
 			continue
 		}
+		f.RxTime = rxTime(oob[:oobn])
 
 		r.record(f)
 	}
@@ -327,6 +361,10 @@ func (r *reader) record(f Frame) {
 	bytesTotal.WithLabelValues(r.iface).Add(float64(len(f.Data)))
 	payloadLen.WithLabelValues(r.iface).Observe(float64(len(f.Data)))
 
+	k := idKey{id: f.ID, extended: f.Extended}
+	r.timing.observe(k, f.RxTime)
+	r.counters.observe(k, f.Data)
+
 	if !r.perID {
 		return
 	}
@@ -350,12 +388,42 @@ func (r *reader) record(f Frame) {
 	}
 	r.mu.Unlock()
 
-	// Hex, zero-padded — sorts correctly and matches how candump prints IDs.
-	id := fmt.Sprintf("%03X", f.ID)
-	if f.Extended {
-		id = fmt.Sprintf("%08X", f.ID)
+	framesTotal.WithLabelValues(r.iface, k.label(), format).Inc()
+}
+
+// idKey identifies a message. The frame kind is part of it because a
+// standard and an extended frame can carry the same numeric ID.
+type idKey struct {
+	id       uint32
+	extended bool
+}
+
+// label is the can_id label value. Hex, zero-padded — sorts correctly and
+// matches how candump prints IDs.
+func (k idKey) label() string {
+	if k.extended {
+		return fmt.Sprintf("%08X", k.id)
 	}
-	framesTotal.WithLabelValues(r.iface, id, format).Inc()
+	return fmt.Sprintf("%03X", k.id)
+}
+
+// parseID reads a CAN ID written in hex the way candump prints it: up to
+// three digits is a standard ID, more is an extended one. A 0x prefix is
+// allowed.
+func parseID(s string) (idKey, error) {
+	digits := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(s)), "0x")
+	v, err := strconv.ParseUint(digits, 16, 32)
+	if err != nil {
+		return idKey{}, fmt.Errorf("%q is not a hex CAN ID", s)
+	}
+	k := idKey{id: uint32(v), extended: len(digits) > 3}
+	if k.extended && v > canEFFMask {
+		return idKey{}, fmt.Errorf("%q is above 1FFFFFFF, the largest extended CAN ID", s)
+	}
+	if !k.extended && v > canSFFMask {
+		return idKey{}, fmt.Errorf("%q is above 7FF, the largest standard CAN ID", s)
+	}
+	return k, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -368,8 +436,20 @@ func main() {
 		maxIDs = flag.Int("max-ids", 256, "cap on distinct IDs before collapsing to 'overflow'")
 		noFD   = flag.Bool("no-fd", false, "disable CAN-FD reception (classic frames only)")
 		noErrs = flag.Bool("no-errors", false, "don't subscribe to error frames")
+
+		periodSpec  = flag.String("periods", "", "expected period per CAN ID, e.g. 100:5ms,18DAF110:500ms; enables interval, late and estimated-missed metrics")
+		counterSpec = flag.String("counters", "", "payload bytes holding a big-endian rolling counter per CAN ID, e.g. 100:0-3; enables exact missed and restart metrics")
 	)
 	flag.Parse()
+
+	periods, err := parsePeriods(*periodSpec)
+	if err != nil {
+		log.Fatalf("-periods: %v", err)
+	}
+	counterFields, err := parseCounters(*counterSpec)
+	if err != nil {
+		log.Fatalf("-counters: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -382,7 +462,11 @@ func main() {
 		}
 		fds = append(fds, fd)
 
-		r := &reader{iface: name, fd: fd, perID: *perID, maxIDs: *maxIDs}
+		r := &reader{
+			iface: name, fd: fd, perID: *perID, maxIDs: *maxIDs,
+			timing:   newTiming(name, periods),
+			counters: newCounters(name, counterFields),
+		}
 		go r.run(ctx)
 	}
 
@@ -412,7 +496,7 @@ func main() {
 	log.Println("shutting down")
 	cancel()
 	for _, fd := range fds {
-		unix.Close(fd) // unblocks the readers stuck in Read()
+		unix.Close(fd)
 	}
 
 	shutdownCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
